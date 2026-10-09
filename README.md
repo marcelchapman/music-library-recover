@@ -4,7 +4,7 @@ A tool for detecting and recovering missing music files after library migration 
 
 ## The Problem
 
-During the migration of my music collection from an old library to a new one, some folders were not transferred.
+During the migration of my music collection from an old library to a new one, some tracks and folders were not transferred.
 
 The libraries were large enough that manually comparing them was impractical. I needed a reliable way to determine:
 
