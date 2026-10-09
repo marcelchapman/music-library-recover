@@ -20,9 +20,14 @@
 #
 #############################################################
 
-SOURCE="/Volumes/External Disk/Later/Media.localized"
-DEST="/Volumes/Dropbox"
-LIST="$HOME/Desktop/difflist.txt"
+# Source: original music library
+SOURCE="/path/to/original/music/library"
+
+# Destination: where recovered folders will be copied
+DEST="/path/to/recovery/destination"
+
+# List: file containing the missing folder paths
+LIST="/path/to/difflist.txt"
 
 MP3_COUNT=0
 AIFF_COUNT=0
