@@ -1,183 +1,94 @@
+![Music Library Recovery](assets/banner.png)
+
 # Music Library Recovery
 
-A tool for detecting and recovering missing music files after library migration or copying operations.
+**Find what's missing. Recover what matters.**
 
-## The Problem
+A filesystem comparison and recovery utility designed to identify, classify and recover missing music library folders.
 
-During the migration of my music collection from an old library to a new one, some tracks and folders were not transferred.
+## Overview
 
-The libraries were large enough that manually comparing them was impractical. I needed a reliable way to determine:
+Music Library Recovery originated from a real problem encountered during the migration of my personal music collection.
 
-- which folders existed in the old library but not in the new one;
-- which of those missing folders contained MP3 files;
-- which contained AIFF/AIF files;
-- which contained other audio formats or combinations of formats;
-- and how to copy the missing folders to a second external drive without having to manage the process manually.
+Some folders had not been transferred, and the size of the collection made manual comparison impractical. Rather than performing another full synchronisation, I needed a precise way to identify and recover only what was missing.
 
-The goal was not to analyse individual music files. The problem was primarily about comparing directory structures and then processing the folders identified as missing.
+The result was a focused command-line workflow built using Bash and standard Unix filesystem utilities.
 
-## The Initial Approach
+## The Solution
 
-I had previously used **Sync Folders Pro** for file and folder synchronisation.
+The recovery process consists of three main stages:
 
-It was useful for synchronisation tasks, but for this particular problem I found the graphical approach unnecessarily complicated. I did not need to synchronise two libraries according to a large set of configurable rules.
+- **Detection** — Compare the directory structures of the original and current libraries to identify missing folders.
+- **Classification** — Inspect the missing folders and categorise them according to their audio content.
+- **Recovery** — Copy the identified folders to a designated recovery destination using `rsync`.
 
-I needed something much more specific:
+The original libraries are used as sources of information and content, rather than targets for deletion or synchronisation.
 
-> Find the folders that exist in the old library but not in the new library, then process only those folders.
+## Workflow
 
-This led me to investigate a command-line solution using standard Unix tools.
+## Workflow
 
-## The First Solution: Comparing Directory Structures
+![Music Library Recovery workflow](assets/workflow.svg)
 
-The first stage was to generate a list of directories from each library.
+## Audio Classification
 
-The basic tools used were:
+| Category | Description |
+|---|---|
+| MP3 | Folders containing exclusively MP3 audio |
+| AIFF | Folders containing exclusively AIFF or AIF audio |
+| MIXED | Combinations of formats or other audio formats |
 
-- `find` — to discover directories;
-- `sort` — to put the directory lists into a predictable order;
-- `comm` — to compare the two sorted lists;
-- shell redirection — to save the resulting list to a file.
+The classification is based on file extensions. Non-audio files, such as artwork, documents and playlists, are intended to be excluded from the classification process.
 
-The result was a file containing the folders that existed in the old library but were missing from the new one:
+## Technical Implementation
 
-```text
-difflist.txt
-```
+The current recovery implementation is available in [`missingfolders.sh`](missingfolders.sh).
 
-This transformed the original problem from:
+The comparison stage generates a list of missing directories, stored in `difflist.txt`. The recovery script then processes that list, classifies the folders and copies their contents to the recovery destination.
 
-> "How do I compare two enormous music libraries?"
+### Technologies
 
-into:
+| Technology | Purpose |
+|---|---|
+| Bash | Workflow automation and processing logic |
+| find | Filesystem traversal |
+| sort | Directory list ordering |
+| comm | Directory list comparison |
+| wc | File counting |
+| mkdir | Destination directory creation |
+| rsync | File and directory copying |
+| Git & GitHub | Version control and project development |
 
-> "Here is a finite list of folders that need to be processed."
+## Usage
 
-That list became the input to the next stage.
+The current Bash implementation requires manual configuration.
 
-## The Second Solution: Classifying the Missing Albums
+1. Generate a list of missing directories by comparing the original and current library structures.
+2. Configure the source, recovery destination and missing-directory list in `missingfolders.sh`.
+3. Review the paths and directory list before executing the script.
+4. Run the script using Bash.
+5. Review the recovery summary and any reported errors.
 
-Once the missing folders had been identified, I wanted to organise them according to their audio content.
+Always test with a small, controlled dataset before processing an important music collection.
 
-The classification rules became:
+## Development Status
 
-### MP3
+**Working Bash prototype — successfully tested on a real music collection.**
 
-The folder contains MP3 audio files only.
+The project is currently evolving towards a cross-platform Python desktop application.
 
-### AIFF
+Planned development includes:
 
-The folder contains AIFF/AIF audio files only.
+- Integrated directory comparison.
+- Automated testing.
+- Recovery preview and selection.
+- A minimalist graphical interface.
+- Cross-platform compatibility.
 
-### MIXED
+The original Bash implementation remains the functional foundation of the project.
 
-The folder contains any other situation, including:
+## Project Philosophy
 
-- MP3 + AIFF;
-- FLAC;
-- WAV;
-- M4A;
-- AAC;
-- OGG;
-- DSD;
-- another unknown audio format.
+Music Library Recovery is built around a simple principle: solve a specific problem with precision, without introducing unnecessary complexity.
 
-Non-audio files such as artwork, documents, playlists and metadata files are ignored for the purpose of determining the audio classification.
-
-## The Final Workflow
-
-The process eventually became:
-
-```text
-Old Music Library
-        │
-        ▼
-     find
-        │
-        ▼
-Directory list
-        │
-        ▼
-     sort
-        │
-        ▼
-Compare with new library
-        │
-        ▼
-     comm
-        │
-        ▼
-difflist.txt
-        │
-        ▼
-Read each missing folder
-        │
-        ▼
-Inspect audio files
-        │
-        ▼
-Classify
-   ┌────┼─────┐
-   ▼    ▼     ▼
-  MP3  AIFF  MIXED
-   └────┼─────┘
-        ▼
-      rsync
-        │
-        ▼
-Second external drive
-```
-
-The final Bash script reads `difflist.txt`, examines each missing folder, determines its category, creates the corresponding destination directory, and copies the folder using `rsync`.
-
-## The Working Script
-
-The current working implementation is:
-
-```text
-missingfolders.sh
-```
-
-It uses:
-
-- Bash
-- `find`
-- `wc`
-- `mkdir`
-- `rsync`
-- shell variables
-- loops
-- conditionals
-- exit-status checking
-
-The script also maintains counters for the number of MP3, AIFF and MIXED albums processed, as well as skipped folders and errors.
-
-## Result
-
-The script was tested against the real music collection.
-
-It scanned the complete set of missing folders and successfully processed the collection, correctly separating the recovered folders into the designated categories.
-
-This was the first point at which the workflow became a genuinely useful tool rather than simply an experiment with Unix commands.
-
-## Why This Project Exists
-
-This project began as a practical problem with my own music collection.
-
-It subsequently became an opportunity to learn more deeply about:
-
-- Linux and Unix command-line tools;
-- Bash scripting;
-- filesystem operations;
-- pipelines;
-- automation;
-- data processing;
-- reproducible workflows.
-
-The project is therefore both a practical utility and a learning project.
-
-## Current Status
-
-**Working prototype — successfully tested on the real dataset.**
-
-The next stage is to document the implementation, understand its design decisions more deeply, and gradually improve its portability, testing and usability without losing the simplicity of the original solution.
+It is both a practical utility and an ongoing exploration of filesystem operations, automation and software engineering.
