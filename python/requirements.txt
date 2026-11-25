@@ -1,0 +1,2 @@
+# The Qt Core, GUI and Widgets modules used by this prototype.
+PySide6-Essentials==6.10.1
