@@ -2,10 +2,25 @@
 
 import logging
 import sys
+from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QStringListModel, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QFont, QFontDatabase, QIcon
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QStringListModel, Qt, QThread, Signal, Slot
+from PySide6.QtGui import (
+    QAccessible,
+    QAccessibleAnnouncementEvent,
+    QAction,
+    QColor,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -13,11 +28,12 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListView,
     QProgressBar,
     QPushButton,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -27,72 +43,233 @@ from library_comparison import ComparisonError, ComparisonResult, compare_librar
 TITLE = "Music Library Recovery"
 EMBLEM = Path(__file__).resolve().parent.parent / "assets" / "emblem.png"
 
+GROUND = "#181a1d"
+SURFACE = "#212428"
+RULE = "#303538"
+INK = "#f2f0eb"
+SECONDARY = "#b7bec2"
+ACCENT = "#90cbd2"
+FOCUS = "#a5e3eb"
+WARNING = "#f2b2a4"
+
 STYLESHEET = """
-QWidget#window { background: #181c21; color: #eff2f4; }
-QLabel { color: #eff2f4; }
-QLabel#wordmark { color: #c1cbd2; font-size: 13px; font-weight: 600; }
-QLabel#title { font-size: 32px; font-weight: 650; }
-QLabel#subtitle, QLabel#status, QLabel#empty, QLabel#column {
-    color: #aebbc4;
+QWidget#window { background: @ground; color: @ink; }
+QWidget#libraries { background: @surface; border-radius: 6px; }
+QFrame#divider { background: @rule; }
+QLabel { color: @ink; }
+QLabel#title { font-size: 30px; font-weight: 550; }
+QLabel#subtitle { font-size: 15px; color: @secondary; }
+QLabel#sectionTitle { font-size: 20px; font-weight: 550; }
+QLabel#libraryLabel, QLabel#status, QLabel#count, QLabel#hint, QLabel#detail {
+    font-size: 13px;
+    color: @secondary;
 }
-QLabel#status, QLabel#column { font-size: 13px; }
-QLabel#sectionTitle { font-size: 18px; font-weight: 650; }
-QLabel#count {
-    color: #9fe3ec;
-    background: #233941;
-    border-radius: 5px;
-    padding: 3px 8px;
-    font-weight: 600;
-}
-QFrame#surface { background: #20262c; border: 1px solid #39434c; border-radius: 8px; }
-QFrame#divider { background: #39434c; }
-QLineEdit {
-    color: #c5cfd6;
-    background: #171d22;
-    border: 1px solid #48555e;
-    border-radius: 5px;
-    padding: 0 10px;
-    selection-color: #112027;
-    selection-background-color: #8bdce9;
-}
-QLineEdit:focus, QListView:focus { border: 1px solid #86dfec; }
+QLabel#stateTitle { font-size: 15px; font-weight: 500; }
 QPushButton {
-    background: #2b343c;
-    color: #ebf0f3;
-    border: 1px solid #54626c;
+    font-size: 14px;
+    font-weight: 500;
+    color: @ink;
+    background: transparent;
+    border: 2px solid transparent;
     border-radius: 5px;
     padding: 0 14px;
-    font-weight: 600;
 }
-QPushButton:hover { background: #374550; }
-QPushButton:pressed { background: #242d35; }
-QPushButton:focus { border: 2px solid #9fe9f3; padding: 0 13px; }
-QPushButton:disabled { color: #a7b4be; background: #252d34; }
-QPushButton#compare { background: #93dce8; color: #112128; border-color: #93dce8; }
-QPushButton#compare:hover { background: #b1eaf2; }
-QPushButton#compare:pressed { background: #77c4d2; }
-QPushButton#compare:focus { border-color: #f1fbfd; }
-QPushButton#compare:disabled { background: #2d454e; color: #b3ccd3; border-color: #425c67; }
-QListView {
-    background: #1a2026;
-    color: #e4ecef;
-    border: 1px solid #39434c;
-    border-radius: 5px;
-    outline: 0;
-    alternate-background-color: #20272e;
-}
-QListView::item { padding: 8px 12px; }
-QListView::item:selected { background: #314d59; color: #f2f8fa; }
-QProgressBar { background: #2b3840; border: 0; border-radius: 2px; }
-QProgressBar::chunk { background: #93dce8; border-radius: 2px; }
+QPushButton:hover { background: #2c3136; }
+QPushButton:pressed { background: #343b40; }
+QPushButton:disabled { color: #969ea3; }
+QPushButton#compare { background: @accent; color: #132528; padding: 0 19px; }
+QPushButton#compare:hover { background: #a9d9de; }
+QPushButton#compare:pressed { background: #7cb8bf; }
+QPushButton#compare:disabled { background: #2a3438; color: #a0adb0; }
+QPushButton:focus, QPushButton#compare:focus { border-color: @focus; }
+QPushButton#compare:focus { border-color: #ffffff; }
+QListView { background: transparent; border: none; outline: 0; }
+QScrollBar:vertical { background: #202326; border: none; width: 10px; }
+QScrollBar::handle:vertical { background: #697478; min-height: 28px; border-radius: 4px; }
+QScrollBar::handle:vertical:hover { background: #899397; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QProgressBar { background: #303a3e; border: none; border-radius: 2px; }
+QProgressBar::chunk { background: @accent; border-radius: 2px; }
+QToolTip { color: @ink; background: @surface; border: 1px solid #566166; padding: 6px; }
 """
+for token, value in {
+    "@ground": GROUND,
+    "@surface": SURFACE,
+    "@rule": RULE,
+    "@ink": INK,
+    "@secondary": SECONDARY,
+    "@accent": ACCENT,
+    "@focus": FOCUS,
+}.items():
+    STYLESHEET = STYLESHEET.replace(token, value)
 
 
-def label(text: str, style: str = "") -> QLabel:
+def label(text: str = "", style: str = "") -> QLabel:
     widget = QLabel(text)
     widget.setTextFormat(Qt.TextFormat.PlainText)
     widget.setObjectName(style)
     return widget
+
+
+def divider() -> QFrame:
+    line = QFrame(objectName="divider")
+    line.setFixedHeight(1)
+    return line
+
+
+def tooltip(text: str) -> str:
+    return f'<span style="white-space: pre-wrap">{escape(text)}</span>'
+
+
+def draw_symbol(painter: QPainter, kind: str, bounds: QRectF, color: str) -> None:
+    """Draw the same outline weight for folder and status symbols."""
+    painter.save()
+    painter.translate(bounds.topLeft())
+    painter.scale(bounds.width() / 20, bounds.height() / 20)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor(color), 1.35, Qt.PenStyle.SolidLine,
+                        Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    path = QPainterPath()
+    if kind == "folder":
+        path.moveTo(3, 4.5)
+        path.lineTo(7.5, 4.5)
+        path.lineTo(9.5, 6.5)
+        path.lineTo(17, 6.5)
+        path.quadTo(18, 6.5, 18, 7.5)
+        path.lineTo(18, 15.5)
+        path.quadTo(18, 17, 16.5, 17)
+        path.lineTo(3.5, 17)
+        path.quadTo(2, 17, 2, 15.5)
+        path.lineTo(2, 6)
+        path.quadTo(2, 4.5, 3, 4.5)
+        path.closeSubpath()
+    else:
+        painter.drawEllipse(QRectF(2, 2, 16, 16))
+        if kind == "check":
+            path.moveTo(6, 10.2)
+            path.lineTo(8.7, 12.8)
+            path.lineTo(14, 7.5)
+        elif kind == "clock":
+            path.moveTo(10, 5.8)
+            path.lineTo(10, 10)
+            path.lineTo(13, 11.8)
+        else:
+            path.moveTo(10, 6)
+            path.lineTo(10, 10.7)
+            path.moveTo(10, 13.8)
+            path.lineTo(10, 14)
+    painter.drawPath(path)
+    painter.restore()
+
+
+def set_symbol(widget: QLabel, kind: str, size: int, color: str = SECONDARY) -> None:
+    scale = widget.devicePixelRatioF()
+    pixmap = QPixmap(round(size * scale), round(size * scale))
+    pixmap.setDevicePixelRatio(scale)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    with QPainter(pixmap) as painter:
+        draw_symbol(painter, kind, QRectF(0, 0, size, size), color)
+    widget.setPixmap(pixmap)
+    widget.setFixedSize(size, size)
+
+
+def add_copy_action(widget: QWidget, title: str, get_path) -> QAction:
+    action = QAction(title, widget)
+    action.setShortcut(QKeySequence.StandardKey.Copy)
+    action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+
+    def copy_path():
+        path = get_path()
+        if path:
+            QApplication.clipboard().setText(str(path))
+
+    action.triggered.connect(copy_path)
+    widget.addAction(action)
+    widget.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+    return action
+
+
+class FolderName(QLabel):
+    """Keep a folder's full name available while eliding the visible line."""
+
+    def __init__(self):
+        super().__init__()
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setMinimumWidth(0)
+        self.name = ""
+
+    def show_folder(self, path: Path | None) -> None:
+        self.name = (path.name or str(path)) if path is not None else "No folder selected"
+        weight, color = (500, INK) if path is not None else (400, SECONDARY)
+        self.setStyleSheet(f"font-size: 16px; font-weight: {weight}; color: {color};")
+        self.setAccessibleName(self.name)
+        self.setToolTip(tooltip(str(path)) if path is not None else "")
+        self.refresh_text()
+
+    def refresh_text(self) -> None:
+        self.setText(self.fontMetrics().elidedText(self.name, Qt.TextElideMode.ElideRight, self.width()))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.refresh_text()
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.fontMetrics().height())
+
+
+class FolderPaths(QStringListModel):
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if index.isValid() and role == Qt.ItemDataRole.ToolTipRole:
+            return tooltip(super().data(index, Qt.ItemDataRole.DisplayRole))
+        return super().data(index, role)
+
+
+class ResultRow(QStyledItemDelegate):
+    """Paint name and location while the model keeps the full relative path."""
+
+    def __init__(self, parent: QListView):
+        super().__init__(parent)
+        self.name_font = QFont(parent.font())
+        self.name_font.setPixelSize(15)
+        self.name_font.setWeight(QFont.Weight.Medium)
+        self.location_font = QFont(parent.font())
+        self.location_font.setPixelSize(13)
+
+    def sizeHint(self, option, index) -> QSize:
+        return QSize(0, 60)
+
+    def paint(self, painter, option, index) -> None:
+        parent, _, name = index.data().rpartition("/")
+        location = parent.replace("/", " / ") if parent else "Top-level folder"
+        row = option.rect
+        state = option.state
+
+        painter.save()
+        painter.setClipRect(row)
+        if state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(row.adjusted(0, 0, 0, -1), QColor("#2a383d"))
+        elif state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(row.adjusted(0, 0, 0, -1), QColor("#202326"))
+        painter.fillRect(QRect(row.x(), row.bottom(), row.width(), 1), QColor(RULE))
+        if state & QStyle.StateFlag.State_HasFocus:
+            painter.setPen(QPen(QColor(FOCUS), 1.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(QRectF(row).adjusted(1, 1, -1, -2), 4, 4)
+
+        draw_symbol(painter, "folder", QRectF(row.x() + 15, row.y() + 20, 20, 20), SECONDARY)
+        self.draw_line(painter, name, self.name_font, INK, row, 10, 22, Qt.TextElideMode.ElideRight)
+        self.draw_line(painter, location, self.location_font, SECONDARY, row, 31, 19, Qt.TextElideMode.ElideLeft)
+        painter.restore()
+
+    @staticmethod
+    def draw_line(painter, text, font, color, row, top, height, elide) -> None:
+        bounds = QRect(row.x() + 48, row.y() + top, max(0, row.width() - 64), height)
+        painter.setFont(font)
+        painter.setPen(QColor(color))
+        painter.drawText(bounds, Qt.AlignmentFlag.AlignVCenter,
+                         painter.fontMetrics().elidedText(text, elide, bounds.width()))
 
 
 class ComparisonThread(QThread):
@@ -119,35 +296,35 @@ class ComparisonThread(QThread):
 class LibraryPicker(QWidget):
     changed = Signal()
 
-    def __init__(self, title: str, description: str):
+    def __init__(self, title: str):
         super().__init__()
         self.path: Path | None = None
-
-        heading = label(title)
-        heading.setStyleSheet("font-weight: 650;")
-        hint = label(description, "status")
-        self.path_field = QLineEdit()
-        self.path_field.setReadOnly(True)
-        self.path_field.setPlaceholderText("No folder selected")
-        self.path_field.setAccessibleName(title + " folder")
-        self.path_field.setMinimumHeight(44)
-        self.choose_button = QPushButton("Choose folder…")
-        self.choose_button.setAccessibleName("Choose " + title.lower() + " folder")
-        self.choose_button.setMinimumHeight(44)
-        self.choose_button.clicked.connect(self.choose)
+        self.title = title
         self.dialog_title = "Choose " + title.lower()
 
-        fields = QHBoxLayout()
-        fields.setSpacing(10)
-        fields.addWidget(self.path_field, 1)
-        fields.addWidget(self.choose_button)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        layout.addWidget(heading)
-        layout.addWidget(hint)
-        layout.addSpacing(4)
-        layout.addLayout(fields)
+        heading = label(title, "libraryLabel")
+        self.folder_name = FolderName()
+        self.folder_name.show_folder(None)
+        self.choose_button = QPushButton("Choose folder…")
+        self.choose_button.setAccessibleName(self.dialog_title + " folder")
+        self.choose_button.setMinimumSize(138, 44)
+        self.choose_button.clicked.connect(self.choose)
+        self.copy_action = add_copy_action(self.choose_button, "Copy folder path", lambda: self.path)
+        self.copy_action.setEnabled(False)
+
+        icon = QLabel()
+        set_symbol(icon, "folder", 20)
+        names = QVBoxLayout()
+        names.setSpacing(3)
+        names.addWidget(heading)
+        names.addWidget(self.folder_name)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 12, 12, 12)
+        layout.setSpacing(12)
+        layout.addWidget(icon)
+        layout.addLayout(names, 1)
+        layout.addWidget(self.choose_button)
 
     @Slot()
     def choose(self) -> None:
@@ -159,10 +336,15 @@ class LibraryPicker(QWidget):
             | QFileDialog.Option.ReadOnly
             | QFileDialog.Option.DontResolveSymlinks,
         )
+        self.choose_button.setFocus()
         if folder:
             self.path = Path(folder)
-            self.path_field.setText(str(self.path))
-            self.path_field.setToolTip(str(self.path))
+            self.folder_name.show_folder(self.path)
+            self.choose_button.setText("Change…")
+            self.choose_button.setAccessibleName("Change " + self.title.lower() + " folder")
+            self.choose_button.setAccessibleDescription(str(self.path))
+            self.choose_button.setToolTip(tooltip(str(self.path)))
+            self.copy_action.setEnabled(True)
             self.changed.emit()
 
 
@@ -172,120 +354,129 @@ class Window(QWidget):
         self.setObjectName("window")
         self.setWindowTitle(TITLE)
         self.setWindowIcon(QIcon(str(EMBLEM)))
-        self.setMinimumSize(560, 640)
-        self.resize(780, 712)
+        self.setMinimumSize(470, 520)
+        self.resize(700, 602)
         self.thread: ComparisonThread | None = None
         self.close_after_scan = False
+        self.restore_compare_focus = False
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(32, 24, 32, 28)
+        frame = QHBoxLayout(self)
+        frame.setContentsMargins(36, 34, 36, 20)
+        canvas = QWidget()
+        canvas.setMaximumWidth(780)
+        frame.addWidget(canvas, 1)
+        layout = QVBoxLayout(canvas)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        brand = QHBoxLayout()
-        brand.setSpacing(10)
-        icon = QLabel()
-        icon.setPixmap(self.windowIcon().pixmap(32, 32))
-        brand.addWidget(icon)
-        brand.addWidget(label(TITLE, "wordmark"), 1)
-        layout.addLayout(brand)
-        layout.addSpacing(16)
         layout.addWidget(label("Compare libraries", "title"))
-        subtitle = label(
-            "Find folders from your original library that are missing in your current library.",
-            "subtitle",
-        )
-        subtitle.setWordWrap(True)
-        layout.addSpacing(4)
-        layout.addWidget(subtitle)
-        layout.addSpacing(18)
+        layout.addSpacing(6)
+        layout.addWidget(label("Find what's missing from your collection.", "subtitle"))
+        layout.addSpacing(26)
 
-        libraries = QFrame(objectName="surface")
+        libraries = QWidget(objectName="libraries")
         library_layout = QVBoxLayout(libraries)
-        library_layout.setContentsMargins(16, 12, 16, 12)
-        library_layout.setSpacing(10)
-        self.original = LibraryPicker("Original library", "The collection you started with.")
-        self.current = LibraryPicker("Current library", "The collection you want to check.")
-        divider = QFrame(objectName="divider")
-        divider.setFixedHeight(1)
+        library_layout.setContentsMargins(0, 0, 0, 0)
+        library_layout.setSpacing(0)
+        self.original = LibraryPicker("Original library")
+        self.current = LibraryPicker("Current library")
         library_layout.addWidget(self.original)
-        library_layout.addWidget(divider)
+        library_layout.addWidget(divider())
         library_layout.addWidget(self.current)
         layout.addWidget(libraries)
-        layout.addSpacing(12)
+        layout.addSpacing(14)
 
         action = QHBoxLayout()
-        action.setSpacing(12)
-        self.status = label("", "status")
+        action.setSpacing(9)
+        self.status_icon = QLabel()
+        self.status = label(style="status")
         self.status.setWordWrap(True)
         self.progress = QProgressBar()
-        self.progress.setAccessibleName("Scanning both libraries")
+        self.progress.setAccessibleName("Comparison progress")
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
-        self.progress.setFixedSize(64, 4)
+        self.progress.setFixedSize(42, 4)
         self.progress.hide()
         self.compare_button = QPushButton("Compare libraries", objectName="compare")
         self.compare_button.setMinimumHeight(44)
+        action.addWidget(self.status_icon)
         action.addWidget(self.status, 1)
         action.addWidget(self.progress)
         action.addWidget(self.compare_button)
         layout.addLayout(action)
-        layout.addSpacing(14)
+        layout.addSpacing(26)
 
-        results = QFrame(objectName="surface")
-        results_layout = QVBoxLayout(results)
-        results_layout.setContentsMargins(16, 12, 16, 14)
-        results_layout.setSpacing(8)
-        results_heading = QHBoxLayout()
-        results_heading.addWidget(label("Missing folders", "sectionTitle"))
-        results_heading.addStretch()
-        self.count = label("", "count")
-        results_heading.addWidget(self.count)
-        results_layout.addLayout(results_heading)
+        result_heading = QHBoxLayout()
+        result_heading.addWidget(label("Missing content", "sectionTitle"))
+        result_heading.addStretch()
+        self.count = label(style="count")
+        result_heading.addWidget(self.count)
+        layout.addLayout(result_heading)
+        layout.addSpacing(8)
+        layout.addWidget(divider())
 
         self.result_pages = QStackedWidget()
-        self.empty = label("", "empty")
-        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty.setWordWrap(True)
-        self.result_pages.addWidget(self.empty)
+        state_page = QWidget()
+        state_layout = QVBoxLayout(state_page)
+        state_layout.setContentsMargins(16, 16, 16, 0)
+        state_layout.setSpacing(4)
+        self.state_title = label(style="stateTitle")
+        self.state_detail = label(style="detail")
+        self.state_detail.setWordWrap(True)
+        self.state_detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        state_layout.addWidget(self.state_title)
+        state_layout.addWidget(self.state_detail)
+        state_layout.addStretch()
+        self.result_pages.addWidget(state_page)
 
-        paths_page = QWidget()
-        paths_layout = QVBoxLayout(paths_page)
-        paths_layout.setContentsMargins(0, 0, 0, 0)
-        paths_layout.setSpacing(5)
-        paths_layout.addWidget(label("Path in the original library", "column"))
         self.paths = QListView()
-        self.paths.setAccessibleName("Missing paths in the original library")
-        self.paths.setAlternatingRowColors(True)
+        self.paths.setAccessibleName("Missing folders in the original library")
+        self.paths.setMouseTracking(True)
         self.paths.setUniformItemSizes(True)
-        self.paths.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.paths.setHorizontalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        self.paths.setResizeMode(QListView.ResizeMode.Adjust)
+        self.paths.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.paths.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
-        self.path_model = QStringListModel(self)
-        self.paths.setModel(self.path_model)
         self.paths.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        paths_layout.addWidget(self.paths)
-        self.result_pages.addWidget(paths_page)
-        results_layout.addWidget(self.result_pages, 1)
-        layout.addWidget(results, 1)
+        self.path_model = FolderPaths(self)
+        self.paths.setModel(self.path_model)
+        self.paths.setItemDelegate(ResultRow(self.paths))
+        copy_result = add_copy_action(self.paths, "Copy relative path", lambda: self.paths.currentIndex().data())
+        copy_result.setEnabled(False)
+        self.paths.selectionModel().currentChanged.connect(
+            lambda current, previous: copy_result.setEnabled(current.isValid())
+        )
+        self.result_pages.addWidget(self.paths)
+        layout.addWidget(self.result_pages, 1)
 
         self.original.changed.connect(self.reset_results)
         self.current.changed.connect(self.reset_results)
         self.compare_button.clicked.connect(self.start_comparison)
+        self.setTabOrder(self.original.choose_button, self.current.choose_button)
+        self.setTabOrder(self.current.choose_button, self.compare_button)
+        self.setTabOrder(self.compare_button, self.paths)
         self.reset_results()
+
+    def set_status(self, text: str, kind: str, color: str = SECONDARY) -> None:
+        self.status.setText(text)
+        self.status_icon.setVisible(bool(kind))
+        if kind:
+            set_symbol(self.status_icon, kind, 17, color)
+
+    def show_message(self, title: str = "", detail: str = "") -> None:
+        self.path_model.setStringList([])
+        self.count.hide()
+        self.state_title.setText(title)
+        self.state_title.setVisible(bool(title))
+        self.state_detail.setText(detail)
+        self.state_detail.setVisible(bool(detail))
+        self.result_pages.setCurrentIndex(0)
 
     @Slot()
     def reset_results(self) -> None:
         ready = self.original.path is not None and self.current.path is not None
         self.compare_button.setEnabled(ready)
-        self.status.setText("Ready to compare." if ready else "Choose both library folders to begin.")
-        self.show_message("Your comparison results will appear here.")
-
-    def show_message(self, text: str, error: bool = False) -> None:
-        self.path_model.setStringList([])
-        self.count.hide()
-        self.empty.setStyleSheet("color: #ffb3a5;" if error else "")
-        self.empty.setText(text)
-        self.result_pages.setCurrentIndex(0)
+        self.set_status("Ready to compare." if ready else "Choose both library folders.", "")
+        self.show_message(detail="Missing folders will appear here after a comparison.")
 
     @Slot()
     def start_comparison(self) -> None:
@@ -293,8 +484,9 @@ class Window(QWidget):
         if original is None or current is None or self.thread is not None:
             return
 
-        self.show_message("Looking for missing folders…")
-        self.status.setText("Scanning both libraries…")
+        self.restore_compare_focus = self.compare_button.hasFocus()
+        self.show_message()
+        self.set_status("Comparing libraries…", "clock")
         self.progress.show()
         self.original.choose_button.setEnabled(False)
         self.current.choose_button.setEnabled(False)
@@ -309,26 +501,33 @@ class Window(QWidget):
 
     @Slot(object)
     def show_result(self, result: ComparisonResult) -> None:
-        if result.missing:
+        count = len(result.missing)
+        if count:
             self.path_model.setStringList(list(result.missing))
-            self.result_pages.setCurrentIndex(1)
+            self.result_pages.setCurrentWidget(self.paths)
+            self.paths.scrollToTop()
         else:
             self.show_message("No missing folders found.")
-        self.count.setText(f"{len(result.missing):,}")
-        self.count.setAccessibleName(f"{len(result.missing):,} missing folders")
+        noun = "folder" if count == 1 else "folders"
+        self.count.setText(f"{count:,} {noun}")
         self.count.show()
 
         status = "Comparison complete."
-        if result.skipped_links == 1:
-            status += " 1 link skipped."
-        elif result.skipped_links:
-            status += f" {result.skipped_links:,} links skipped."
-        self.status.setText(status)
+        if result.skipped_links:
+            links = "link" if result.skipped_links == 1 else "links"
+            status += f" {result.skipped_links:,} {links} skipped."
+        self.set_status(status, "check", ACCENT)
+        QAccessible.updateAccessibility(QAccessibleAnnouncementEvent(
+            self.status, f"Comparison complete. {count:,} missing {noun}."
+        ))
 
     @Slot(str)
     def show_error(self, text: str) -> None:
-        self.show_message(text, error=True)
-        self.status.setText("Comparison couldn’t finish.")
+        self.show_message(detail=text)
+        self.set_status("Comparison couldn’t finish.", "warning", WARNING)
+        QAccessible.updateAccessibility(QAccessibleAnnouncementEvent(
+            self.status, f"Comparison couldn’t finish. {text}"
+        ))
 
     @Slot()
     def finish_comparison(self) -> None:
@@ -341,11 +540,13 @@ class Window(QWidget):
         self.compare_button.setEnabled(True)
         if self.close_after_scan:
             self.close()
+        elif self.restore_compare_focus:
+            self.compare_button.setFocus()
 
     def closeEvent(self, event) -> None:
         if self.thread is not None:
             self.close_after_scan = True
-            self.status.setText("Closing when the comparison finishes…")
+            self.set_status("Closing after comparison…", "clock")
             event.ignore()
             return
         super().closeEvent(event)
@@ -357,14 +558,24 @@ def main() -> int:
     app.setWindowIcon(QIcon(str(EMBLEM)))
     app.setStyle("Fusion")
 
-    # Prefer the project's typefaces if installed, otherwise keep the system UI font.
-    installed = QFontDatabase.families()
-    for family in ("Inter", "Geist Sans", "Geist"):
-        if family in installed:
-            font = QFont(app.font())
-            font.setFamily(family)
-            app.setFont(font)
-            break
+    palette = app.palette()
+    for role, color in (
+        (QPalette.ColorRole.Window, GROUND),
+        (QPalette.ColorRole.Base, GROUND),
+        (QPalette.ColorRole.WindowText, INK),
+        (QPalette.ColorRole.Text, INK),
+        (QPalette.ColorRole.Button, SURFACE),
+        (QPalette.ColorRole.ButtonText, INK),
+        (QPalette.ColorRole.Highlight, "#36535a"),
+        (QPalette.ColorRole.HighlightedText, INK),
+    ):
+        palette.setColor(role, QColor(color))
+    app.setPalette(palette)
+
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
+    if "Inter" in QFontDatabase.families():
+        font.setFamily("Inter")
+    app.setFont(font)
 
     window = Window()
     window.setStyleSheet(STYLESHEET)
