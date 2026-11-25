@@ -26,8 +26,6 @@ The original libraries are used as sources of information and content, rather th
 
 ## Workflow
 
-## Workflow
-
 ![Music Library Recovery workflow](assets/workflow.svg)
 
 ## Audio Classification
