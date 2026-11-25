@@ -85,6 +85,16 @@ Planned development includes:
 
 The original Bash implementation remains the functional foundation of the project.
 
+## Supported Platforms
+
+Music Library Recovery is being developed as a cross-platform desktop application for:
+
+- macOS
+- Linux
+- Windows
+
+The current Bash prototype has been successfully tested on macOS. The Python desktop implementation is under development, with full cross-platform compatibility as a core requirement.
+
 ## Project Philosophy
 
 Music Library Recovery is built around a simple principle: solve a specific problem with precision, without introducing unnecessary complexity.
