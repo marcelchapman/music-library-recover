@@ -2,10 +2,11 @@
 
 import logging
 import sys
+from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QStringListModel, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
     QAccessible,
     QAccessibleAnnouncementEvent,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from audio_classification import Classification, ClassificationError, classify_folder
 from library_comparison import ComparisonError, ComparisonResult, compare_libraries
 
 TITLE = "Music Library Recovery"
@@ -219,11 +221,54 @@ class FolderName(QLabel):
         return QSize(0, self.fontMetrics().height())
 
 
-class FolderPaths(QStringListModel):
+@dataclass(frozen=True)
+class MissingFolder:
+    path: str
+    classification: Classification | None
+    error: str = ""
+
+    @property
+    def format_label(self) -> str:
+        return self.classification.audio_format.value if self.classification else "Format unavailable"
+
+    @property
+    def unknown_label(self) -> str:
+        count = self.classification.unknown_files if self.classification else 0
+        if not count:
+            return ""
+        noun = "file" if count == 1 else "files"
+        return f"{count:,} unknown {noun}"
+
+
+class FolderPaths(QAbstractListModel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.folders: list[MissingFolder] = []
+
+    def set_folders(self, folders: list[MissingFolder]) -> None:
+        self.beginResetModel()
+        self.folders = folders
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.folders)
+
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if index.isValid() and role == Qt.ItemDataRole.ToolTipRole:
-            return tooltip(super().data(index, Qt.ItemDataRole.DisplayRole))
-        return super().data(index, role)
+        if not index.isValid() or not 0 <= index.row() < len(self.folders):
+            return None
+        folder = self.folders[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return folder.path
+        if role == Qt.ItemDataRole.UserRole:
+            return folder
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            return f"{folder.path}, {folder.format_label}"
+        if role == Qt.ItemDataRole.AccessibleDescriptionRole:
+            return folder.error or folder.unknown_label
+        if role == Qt.ItemDataRole.ToolTipRole:
+            lines = (folder.path, folder.format_label, folder.error or folder.unknown_label)
+            return "<br>".join(tooltip(line) for line in lines if line)
+        return None
 
 
 class ResultRow(QStyledItemDelegate):
@@ -241,7 +286,8 @@ class ResultRow(QStyledItemDelegate):
         return QSize(0, 60)
 
     def paint(self, painter, option, index) -> None:
-        parent, _, name = index.data().rpartition("/")
+        folder = index.data(Qt.ItemDataRole.UserRole)
+        parent, _, name = folder.path.rpartition("/")
         location = parent.replace("/", " / ") if parent else "Top-level folder"
         row = option.rect
         state = option.state
@@ -259,21 +305,36 @@ class ResultRow(QStyledItemDelegate):
             painter.drawRoundedRect(QRectF(row).adjusted(1, 1, -1, -2), 4, 4)
 
         draw_symbol(painter, "folder", QRectF(row.x() + 15, row.y() + 20, 20, 20), SECONDARY)
-        self.draw_line(painter, name, self.name_font, INK, row, 10, 22, Qt.TextElideMode.ElideRight)
-        self.draw_line(painter, location, self.location_font, SECONDARY, row, 31, 19, Qt.TextElideMode.ElideLeft)
+        classification_width = 134
+        content_left = row.x() + 48
+        format_left = row.right() - 15 - classification_width
+        content_width = max(0, format_left - content_left - 12)
+        name_line = QRect(content_left, row.y() + 10, content_width, 22)
+        location_line = QRect(content_left, row.y() + 31, content_width, 19)
+        format_line = QRect(format_left, name_line.y(), classification_width, name_line.height())
+        self.draw_line(painter, name, self.name_font, INK, name_line)
+        self.draw_line(painter, location, self.location_font, SECONDARY, location_line,
+                       elide=Qt.TextElideMode.ElideLeft)
+        self.draw_line(painter, folder.format_label, self.location_font, INK, format_line,
+                       alignment=Qt.AlignmentFlag.AlignRight)
+        if folder.unknown_label:
+            unknown_line = QRect(format_left, location_line.y(), classification_width, location_line.height())
+            self.draw_line(painter, folder.unknown_label, self.location_font, SECONDARY, unknown_line,
+                           alignment=Qt.AlignmentFlag.AlignRight)
         painter.restore()
 
     @staticmethod
-    def draw_line(painter, text, font, color, row, top, height, elide) -> None:
-        bounds = QRect(row.x() + 48, row.y() + top, max(0, row.width() - 64), height)
+    def draw_line(painter, text, font, color, bounds, *,
+                  alignment=Qt.AlignmentFlag.AlignLeft, elide=Qt.TextElideMode.ElideRight) -> None:
         painter.setFont(font)
         painter.setPen(QColor(color))
-        painter.drawText(bounds, Qt.AlignmentFlag.AlignVCenter,
+        painter.drawText(bounds, Qt.AlignmentFlag.AlignVCenter | alignment,
                          painter.fontMetrics().elidedText(text, elide, bounds.width()))
 
 
 class ComparisonThread(QThread):
-    succeeded = Signal(object)
+    classifying = Signal()
+    succeeded = Signal(object, object)
     failed = Signal(str)
 
     def __init__(self, original: Path, current: Path, parent: QWidget):
@@ -284,13 +345,23 @@ class ComparisonThread(QThread):
     def run(self) -> None:
         try:
             result = compare_libraries(self.original, self.current)
+            folders = []
+            if result.missing:
+                self.classifying.emit()
+                for path in result.missing:
+                    try:
+                        classification = classify_folder(self.original, path)
+                    except ClassificationError as error:
+                        folders.append(MissingFolder(path, None, str(error)))
+                    else:
+                        folders.append(MissingFolder(path, classification))
         except ComparisonError as error:
             self.failed.emit(str(error))
         except Exception:
             logging.error("Unexpected error during library comparison.")
             self.failed.emit("Something interrupted the comparison. Try again.")
         else:
-            self.succeeded.emit(result)
+            self.succeeded.emit(result, folders)
 
 
 class LibraryPicker(QWidget):
@@ -463,7 +534,7 @@ class Window(QWidget):
             set_symbol(self.status_icon, kind, 17, color)
 
     def show_message(self, title: str = "", detail: str = "") -> None:
-        self.path_model.setStringList([])
+        self.path_model.set_folders([])
         self.count.hide()
         self.state_title.setText(title)
         self.state_title.setVisible(bool(title))
@@ -494,16 +565,22 @@ class Window(QWidget):
 
         # Only the worker reads the filesystem. Signals return results to the UI thread.
         self.thread = ComparisonThread(original, current, self)
+        self.thread.classifying.connect(self.show_classification_progress)
         self.thread.succeeded.connect(self.show_result)
         self.thread.failed.connect(self.show_error)
         self.thread.finished.connect(self.finish_comparison)
         self.thread.start()
 
-    @Slot(object)
-    def show_result(self, result: ComparisonResult) -> None:
-        count = len(result.missing)
+    @Slot()
+    def show_classification_progress(self) -> None:
+        if not self.close_after_scan:
+            self.set_status("Checking audio formats…", "clock")
+
+    @Slot(object, object)
+    def show_result(self, result: ComparisonResult, folders: list[MissingFolder]) -> None:
+        count = len(folders)
         if count:
-            self.path_model.setStringList(list(result.missing))
+            self.path_model.set_folders(folders)
             self.result_pages.setCurrentWidget(self.paths)
             self.paths.scrollToTop()
         else:
@@ -512,13 +589,14 @@ class Window(QWidget):
         self.count.setText(f"{count:,} {noun}")
         self.count.show()
 
-        status = "Comparison complete."
+        warning = any(folder.error for folder in folders)
+        status = "Some audio formats couldn’t be checked." if warning else "Comparison complete."
         if result.skipped_links:
             links = "link" if result.skipped_links == 1 else "links"
             status += f" {result.skipped_links:,} {links} skipped."
-        self.set_status(status, "check", ACCENT)
+        self.set_status(status, "warning" if warning else "check", WARNING if warning else ACCENT)
         QAccessible.updateAccessibility(QAccessibleAnnouncementEvent(
-            self.status, f"Comparison complete. {count:,} missing {noun}."
+            self.status, f"{count:,} missing {noun}. {status}"
         ))
 
     @Slot(str)
