@@ -5,13 +5,15 @@ import sys
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
+from threading import Event
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QAbstractListModel, QEvent, QModelIndex, QPointF, QRect, QRectF, QSize, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import (
     QAccessible,
     QAccessibleAnnouncementEvent,
     QAction,
     QColor,
+    QDesktopServices,
     QFont,
     QFontDatabase,
     QIcon,
@@ -25,11 +27,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QListView,
+    QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QStackedWidget,
@@ -41,6 +46,11 @@ from PySide6.QtWidgets import (
 
 from audio_classification import Classification, ClassificationError, classify_folder
 from library_comparison import ComparisonError, ComparisonResult, compare_libraries
+
+from library_recovery import (
+    CATEGORIES, RecoveryCancelled, RecoveryError, RecoveryItem, RecoveryPlan, Status,
+    prepare_recovery, recover,
+)
 
 TITLE = "Music Library Recovery"
 EMBLEM = Path(__file__).resolve().parent.parent / "assets" / "emblem.png"
@@ -55,7 +65,7 @@ FOCUS = "#a5e3eb"
 WARNING = "#f2b2a4"
 
 STYLESHEET = """
-QWidget#window { background: @ground; color: @ink; }
+QWidget#window, QDialog#recoveryDialog { background: @ground; color: @ink; }
 QWidget#libraries { background: @surface; border-radius: 6px; }
 QFrame#divider { background: @rule; }
 QLabel { color: @ink; }
@@ -79,12 +89,13 @@ QPushButton {
 QPushButton:hover { background: #2c3136; }
 QPushButton:pressed { background: #343b40; }
 QPushButton:disabled { color: #969ea3; }
-QPushButton#compare { background: @accent; color: #132528; padding: 0 19px; }
-QPushButton#compare:hover { background: #a9d9de; }
-QPushButton#compare:pressed { background: #7cb8bf; }
-QPushButton#compare:disabled { background: #2a3438; color: #a0adb0; }
-QPushButton:focus, QPushButton#compare:focus { border-color: @focus; }
-QPushButton#compare:focus { border-color: #ffffff; }
+QPushButton[primary="true"] { background: @accent; color: #132528; padding: 0 19px; }
+QPushButton[primary="true"]:hover { background: #a9d9de; }
+QPushButton[primary="true"]:pressed { background: #7cb8bf; }
+QPushButton[primary="true"]:disabled { background: #2a3438; color: #a0adb0; }
+QPushButton:focus { border-color: @focus; }
+QPushButton[primary="true"]:focus { border-color: #ffffff; }
+QPlainTextEdit { background: @surface; color: @ink; border: none; padding: 8px; }
 QListView { background: transparent; border: none; outline: 0; }
 QScrollBar:vertical { background: #202326; border: none; width: 10px; }
 QScrollBar::handle:vertical { background: #697478; min-height: 28px; border-radius: 4px; }
@@ -232,6 +243,10 @@ class MissingFolder:
         return self.classification.audio_format.value if self.classification else "Format unavailable"
 
     @property
+    def eligible(self) -> bool:
+        return bool(self.classification and self.classification.audio_format in CATEGORIES)
+
+    @property
     def unknown_label(self) -> str:
         count = self.classification.unknown_files if self.classification else 0
         if not count:
@@ -241,14 +256,49 @@ class MissingFolder:
 
 
 class FolderPaths(QAbstractListModel):
+    checks_changed = Signal()
+
     def __init__(self, parent):
         super().__init__(parent)
         self.folders: list[MissingFolder] = []
+        self.eligible_rows: set[int] = set()
+        self.checked_rows: set[int] = set()
+        self.checks_enabled = True
 
     def set_folders(self, folders: list[MissingFolder]) -> None:
         self.beginResetModel()
         self.folders = folders
+        self.eligible_rows = {i for i, folder in enumerate(folders) if folder.eligible}
+        self.checked_rows.clear()
         self.endResetModel()
+        self.checks_changed.emit()
+
+    def flags(self, index):
+        flags = super().flags(index)
+        if self.checks_enabled and index.row() in self.eligible_rows:
+            return flags | Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        row = index.row()
+        if role != Qt.ItemDataRole.CheckStateRole or not self.checks_enabled or row not in self.eligible_rows:
+            return False
+        if value == Qt.CheckState.Checked or value == Qt.CheckState.Checked.value:
+            self.checked_rows.add(row)
+        else:
+            self.checked_rows.discard(row)
+        self.dataChanged.emit(index, index, [role, Qt.ItemDataRole.AccessibleTextRole])
+        self.checks_changed.emit()
+        return True
+
+    def toggle_all(self) -> None:
+        if self.checked_rows == self.eligible_rows:
+            self.checked_rows.clear()
+        else:
+            self.checked_rows = self.eligible_rows.copy()
+        self.dataChanged.emit(self.index(0), self.index(len(self.folders) - 1),
+                              [Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.AccessibleTextRole])
+        self.checks_changed.emit()
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.folders)
@@ -261,6 +311,8 @@ class FolderPaths(QAbstractListModel):
             return folder.path
         if role == Qt.ItemDataRole.UserRole:
             return folder
+        if role == Qt.ItemDataRole.CheckStateRole and folder.eligible:
+            return Qt.CheckState.Checked if index.row() in self.checked_rows else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.AccessibleTextRole:
             return f"{folder.path}, {folder.format_label}"
         if role == Qt.ItemDataRole.AccessibleDescriptionRole:
@@ -304,7 +356,19 @@ class ResultRow(QStyledItemDelegate):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(QRectF(row).adjusted(1, 1, -1, -2), 4, 4)
 
-        draw_symbol(painter, "folder", QRectF(row.x() + 15, row.y() + 20, 20, 20), SECONDARY)
+        if folder.eligible:
+            box = QRectF(row.x() + 16, row.y() + 22, 16, 16)
+            checked = index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor(ACCENT if checked else "#778388"), 1.2))
+            painter.setBrush(QColor(ACCENT) if checked else Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(box, 3, 3)
+            if checked:
+                painter.setPen(QPen(QColor("#132528"), 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QPointF(box.x() + 4, box.y() + 8), QPointF(box.x() + 7, box.y() + 11))
+                painter.drawLine(QPointF(box.x() + 7, box.y() + 11), QPointF(box.x() + 12, box.y() + 5))
+        else:
+            draw_symbol(painter, "folder", QRectF(row.x() + 15, row.y() + 20, 20, 20), SECONDARY)
         classification_width = 134
         content_left = row.x() + 48
         format_left = row.right() - 15 - classification_width
@@ -322,6 +386,20 @@ class ResultRow(QStyledItemDelegate):
             self.draw_line(painter, folder.unknown_label, self.location_font, SECONDARY, unknown_line,
                            alignment=Qt.AlignmentFlag.AlignRight)
         painter.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        if not index.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            return False
+        area = QRect(option.rect.x() + 4, option.rect.y() + 8, 40, 44)
+        pointer = (event.type() == QEvent.Type.MouseButtonRelease
+                   and event.button() == Qt.MouseButton.LeftButton
+                   and area.contains(event.position().toPoint()))
+        key = event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Space
+        if pointer or key:
+            checked = index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+            value = Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked
+            return model.setData(index, value, Qt.ItemDataRole.CheckStateRole)
+        return False
 
     @staticmethod
     def draw_line(painter, text, font, color, bounds, *,
@@ -419,6 +497,98 @@ class LibraryPicker(QWidget):
             self.changed.emit()
 
 
+class RecoveryThread(QThread):
+    advanced = Signal(int, int, str)
+
+    def __init__(self, parent, *, selection=None, plan=None):
+        super().__init__(parent)
+        self.selection = selection
+        self.plan = plan
+        self.stop = Event()
+        self.result = None
+        self.error = ""
+        self.preparation_cancelled = False
+
+    def run(self) -> None:
+        try:
+            if self.selection is not None:
+                self.result = prepare_recovery(*self.selection, cancelled=self.stop.is_set)
+            else:
+                self.result = recover(self.plan, cancelled=self.stop.is_set, progress=self.advanced.emit)
+        except RecoveryCancelled:
+            self.preparation_cancelled = True
+        except RecoveryError as error:
+            self.error = str(error)
+        except Exception:
+            logging.error("Unexpected error during recovery.")
+            self.error = "Recovery was interrupted. Check the destination before trying again."
+
+
+def readable_size(size: int) -> str:
+    if size < 1024:
+        return f"{size:,} bytes"
+    value = float(size)
+    for unit in ("KiB", "MiB", "GiB", "TiB", "PiB"):
+        value /= 1024
+        if value < 1024 or unit == "PiB":
+            return f"{value:,.1f} {unit}"
+
+
+class RecoveryDialog(QDialog):
+    def __init__(self, parent, title, subtitle, destination: Path):
+        super().__init__(parent)
+        self.setObjectName("recoveryDialog")
+        self.setWindowTitle(title)
+        self.setStyleSheet(STYLESHEET)
+        self.setMinimumWidth(430)
+        self.resize(540, 340)
+        self.destination = destination
+        self.content = QVBoxLayout(self)
+        self.content.setContentsMargins(24, 22, 24, 18)
+        self.content.setSpacing(8)
+        self.content.addWidget(label(title, "sectionTitle"))
+        explanation = label(subtitle, "subtitle")
+        explanation.setWordWrap(True)
+        self.content.addWidget(explanation)
+        self.content.addSpacing(6)
+        self.content.addWidget(label("Recovery destination", "libraryLabel"))
+        path = label(str(destination), "stateTitle")
+        path.setWordWrap(True)
+        path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.content.addWidget(path)
+
+    def show_entries(self, entries) -> None:
+        if not entries:
+            return
+        self.content.addSpacing(8)
+        self.content.addWidget(divider())
+        details = QPlainTextEdit()
+        details.setReadOnly(True)
+        details.setAccessibleName("Folder details")
+        details.setPlainText("\n\n".join(
+            f"{entry.status.value} · {entry.path}" + (f"\n{entry.detail}" if entry.detail else "")
+            for entry in entries
+        ))
+        self.content.addWidget(details, 1)
+
+    def add_actions(self, dismiss, primary=None) -> None:
+        self.content.addStretch()
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton(dismiss)
+        cancel.setMinimumHeight(42)
+        cancel.setDefault(True)
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        if primary is not None:
+            primary.setMinimumHeight(42)
+            primary.setDefault(False)
+            primary.setAutoDefault(False)
+            row.addWidget(primary)
+        self.content.addLayout(row)
+        cancel.setFocus()
+
+
 class Window(QWidget):
     def __init__(self):
         super().__init__()
@@ -426,10 +596,12 @@ class Window(QWidget):
         self.setWindowTitle(TITLE)
         self.setWindowIcon(QIcon(str(EMBLEM)))
         self.setMinimumSize(470, 520)
-        self.resize(700, 602)
+        self.resize(700, 702)
         self.thread: ComparisonThread | None = None
         self.close_after_scan = False
         self.restore_compare_focus = False
+        self.recovery_worker: RecoveryThread | None = None
+        self.destination: Path | None = None
 
         frame = QHBoxLayout(self)
         frame.setContentsMargins(36, 34, 36, 20)
@@ -470,6 +642,7 @@ class Window(QWidget):
         self.progress.hide()
         self.compare_button = QPushButton("Compare libraries", objectName="compare")
         self.compare_button.setMinimumHeight(44)
+        self.compare_button.setProperty("primary", True)
         action.addWidget(self.status_icon)
         action.addWidget(self.status, 1)
         action.addWidget(self.progress)
@@ -482,6 +655,10 @@ class Window(QWidget):
         result_heading.addStretch()
         self.count = label(style="count")
         result_heading.addWidget(self.count)
+        self.select_all = QPushButton("Select all")
+        self.select_all.setMinimumHeight(36)
+        self.select_all.hide()
+        result_heading.addWidget(self.select_all)
         layout.addLayout(result_heading)
         layout.addSpacing(8)
         layout.addWidget(divider())
@@ -519,12 +696,51 @@ class Window(QWidget):
         self.result_pages.addWidget(self.paths)
         layout.addWidget(self.result_pages, 1)
 
+        self.recovery_controls = QWidget()
+        recovery_layout = QVBoxLayout(self.recovery_controls)
+        recovery_layout.setContentsMargins(0, 8, 0, 0)
+        recovery_layout.setSpacing(6)
+        recovery_layout.addWidget(divider())
+        destination_row = QHBoxLayout()
+        destination_label = label("Recovery destination", "libraryLabel")
+        self.destination_name = FolderName()
+        self.destination_name.show_folder(None)
+        destination_row.addWidget(destination_label)
+        destination_row.addWidget(self.destination_name, 1)
+        self.choose_destination = QPushButton("Choose…")
+        self.choose_destination.setAccessibleName("Choose recovery destination")
+        self.choose_destination.setMinimumHeight(40)
+        self.choose_destination.clicked.connect(self.pick_destination)
+        destination_row.addWidget(self.choose_destination)
+        recovery_layout.addLayout(destination_row)
+        self.selected_count = label("0 selected", "count")
+        self.recover_button = QPushButton("Recover selected")
+        self.recover_button.setProperty("primary", True)
+        self.recover_button.setMinimumHeight(44)
+        self.recover_button.clicked.connect(self.start_recovery)
+        self.cancel_recovery = QPushButton("Cancel recovery")
+        self.cancel_recovery.setMinimumHeight(44)
+        self.cancel_recovery.clicked.connect(self.stop_recovery)
+        self.cancel_recovery.hide()
+        recovery_row = QHBoxLayout()
+        recovery_row.addWidget(self.selected_count)
+        recovery_row.addStretch()
+        recovery_row.addWidget(self.cancel_recovery)
+        recovery_row.addWidget(self.recover_button)
+        recovery_layout.addLayout(recovery_row)
+        layout.addWidget(self.recovery_controls)
+
         self.original.changed.connect(self.reset_results)
         self.current.changed.connect(self.reset_results)
         self.compare_button.clicked.connect(self.start_comparison)
         self.setTabOrder(self.original.choose_button, self.current.choose_button)
         self.setTabOrder(self.current.choose_button, self.compare_button)
-        self.setTabOrder(self.compare_button, self.paths)
+        self.setTabOrder(self.compare_button, self.select_all)
+        self.setTabOrder(self.select_all, self.paths)
+        self.setTabOrder(self.paths, self.choose_destination)
+        self.setTabOrder(self.choose_destination, self.recover_button)
+        self.select_all.clicked.connect(self.path_model.toggle_all)
+        self.path_model.checks_changed.connect(self.update_recovery_controls)
         self.reset_results()
 
     def set_status(self, text: str, kind: str, color: str = SECONDARY) -> None:
@@ -552,12 +768,13 @@ class Window(QWidget):
     @Slot()
     def start_comparison(self) -> None:
         original, current = self.original.path, self.current.path
-        if original is None or current is None or self.thread is not None:
+        if original is None or current is None or self.thread is not None or self.recovery_worker is not None:
             return
 
         self.restore_compare_focus = self.compare_button.hasFocus()
         self.show_message()
         self.set_status("Comparing libraries…", "clock")
+        self.progress.setRange(0, 0)
         self.progress.show()
         self.original.choose_button.setEnabled(False)
         self.current.choose_button.setEnabled(False)
@@ -616,12 +833,173 @@ class Window(QWidget):
         self.original.choose_button.setEnabled(True)
         self.current.choose_button.setEnabled(True)
         self.compare_button.setEnabled(True)
+        self.update_recovery_controls()
         if self.close_after_scan:
             self.close()
         elif self.restore_compare_focus:
             self.compare_button.setFocus()
 
+    @Slot()
+    def update_recovery_controls(self) -> None:
+        model = self.path_model
+        busy = self.recovery_worker is not None
+        eligible = bool(model.eligible_rows)
+        available = eligible and not busy and self.thread is None
+        self.select_all.setVisible(eligible)
+        self.select_all.setEnabled(available)
+        self.select_all.setText("Deselect all" if model.checked_rows == model.eligible_rows else "Select all")
+        self.recovery_controls.setVisible(eligible)
+        self.setMinimumHeight(605 if eligible else 520)
+        self.choose_destination.setEnabled(available)
+        self.recover_button.setEnabled(available and bool(model.checked_rows) and self.destination is not None)
+        self.recover_button.setVisible(not busy)
+        self.cancel_recovery.setVisible(busy)
+        self.selected_count.setText(f"{len(model.checked_rows):,} selected")
+        model.checks_enabled = not busy
+        primary = not eligible
+        if self.compare_button.property("primary") != primary:
+            self.compare_button.setProperty("primary", primary)
+            self.compare_button.style().unpolish(self.compare_button)
+            self.compare_button.style().polish(self.compare_button)
+
+    @Slot()
+    def pick_destination(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose recovery destination", str(self.destination or ""),
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.ReadOnly | QFileDialog.Option.DontResolveSymlinks,
+        )
+        if folder:
+            self.destination = Path(folder)
+            self.destination_name.show_folder(self.destination)
+            self.choose_destination.setText("Change…")
+            self.choose_destination.setAccessibleDescription(str(self.destination))
+            self.choose_destination.setToolTip(tooltip(str(self.destination)))
+            self.update_recovery_controls()
+        self.choose_destination.setFocus()
+
+    @Slot()
+    def start_recovery(self) -> None:
+        if self.thread is not None or self.recovery_worker is not None or not self.recover_button.isEnabled():
+            return
+        model = self.path_model
+        selected = [
+            RecoveryItem(model.folders[i].path, model.folders[i].classification)
+            for i in sorted(model.checked_rows)
+        ]
+        self.begin_recovery_worker(
+            selection=(self.original.path, self.current.path, self.destination, selected)
+        )
+
+    def begin_recovery_worker(self, *, selection=None, plan=None) -> None:
+        self.recovery_worker = RecoveryThread(self, selection=selection, plan=plan)
+        self.recovery_worker.finished.connect(self.finish_recovery_worker)
+        self.recovery_worker.advanced.connect(self.recovery_progress)
+        self.original.choose_button.setEnabled(False)
+        self.current.choose_button.setEnabled(False)
+        self.compare_button.setEnabled(False)
+        self.cancel_recovery.setEnabled(True)
+        self.cancel_recovery.setText("Cancel recovery" if plan else "Cancel preparation")
+        self.progress.setAccessibleName("Recovery progress")
+        self.progress.setRange(0, len(plan.folders) if plan else 0)
+        self.progress.setValue(0)
+        self.progress.show()
+        self.set_status("Preparing recovery…" if selection is not None else "Starting recovery…", "clock")
+        self.update_recovery_controls()
+        self.cancel_recovery.setFocus()
+        self.recovery_worker.start()
+
+    @Slot(int, int, str)
+    def recovery_progress(self, completed: int, total: int, path: str) -> None:
+        if self.recovery_worker is None or self.recovery_worker.stop.is_set():
+            return
+        self.progress.setValue(completed)
+        if path:
+            name = self.status.fontMetrics().elidedText(path.rsplit("/", 1)[-1], Qt.TextElideMode.ElideMiddle, 125)
+            self.set_status(f"{completed:,} of {total:,} processed · {name}", "clock")
+            self.status.setToolTip(tooltip(path))
+        else:
+            self.set_status(f"{completed:,} of {total:,} processed", "clock")
+
+    @Slot()
+    def stop_recovery(self) -> None:
+        if self.recovery_worker is not None:
+            self.recovery_worker.stop.set()
+            self.cancel_recovery.setEnabled(False)
+            self.set_status("Stopping recovery…", "clock")
+
+    @Slot()
+    def finish_recovery_worker(self) -> None:
+        worker = self.recovery_worker
+        self.recovery_worker = None
+        self.progress.hide()
+        self.progress.setAccessibleName("Comparison progress")
+        self.status.setToolTip("")
+        self.original.choose_button.setEnabled(True)
+        self.current.choose_button.setEnabled(True)
+        self.compare_button.setEnabled(True)
+        self.update_recovery_controls()
+        worker.deleteLater()
+        if self.close_after_scan:
+            self.close()
+        elif worker.error:
+            self.set_status("Recovery couldn’t continue.", "warning", WARNING)
+            QMessageBox.warning(self, "Recovery couldn’t continue", worker.error)
+        elif worker.preparation_cancelled or (worker.selection is not None and worker.stop.is_set()):
+            self.set_status("Recovery preparation cancelled.", "")
+        elif worker.selection is not None:
+            self.confirm_recovery(worker.result)
+        else:
+            self.show_recovery_summary(worker.plan.destination.path, worker.result)
+        if self.recovery_worker is None and not self.close_after_scan:
+            self.recover_button.setFocus()
+
+    def confirm_recovery(self, plan: RecoveryPlan) -> None:
+        blocked = len(plan.skipped)
+        count = len(plan.folders)
+        summary = f"{plan.selected_count:,} selected · {count:,} ready · {readable_size(plan.size)} estimated"
+        if blocked:
+            summary += f" · {blocked:,} will be skipped"
+        dialog = RecoveryDialog(self, "Review recovery", summary, plan.destination.path)
+        if blocked:
+            dialog.show_entries(plan.skipped)
+        else:
+            dialog.resize(540, 220)
+        confirm = None
+        if count:
+            confirm = QPushButton("Start recovery")
+            confirm.setProperty("primary", True)
+            confirm.clicked.connect(dialog.accept)
+        dialog.add_actions("Cancel" if count else "Close", confirm)
+        if dialog.exec() == QDialog.DialogCode.Accepted and count:
+            self.begin_recovery_worker(plan=plan)
+        else:
+            self.set_status("Recovery cancelled." if count else "No selected folders can be recovered.", "")
+
+    def show_recovery_summary(self, destination: Path, results) -> None:
+        tally = {status: sum(entry.status == status for entry in results) for status in Status}
+        summary = " · ".join(f"{count:,} {status.value.lower()}" for status, count in tally.items())
+        issues = any(tally[status] for status in (Status.SKIPPED, Status.FAILED, Status.CANCELLED))
+        self.set_status("Recovery finished. Review the results." if issues else "Recovery complete.",
+                        "warning" if issues else "check", WARNING if issues else ACCENT)
+        QAccessible.updateAccessibility(QAccessibleAnnouncementEvent(self.status, f"Recovery results. {summary}"))
+        dialog = RecoveryDialog(self, "Recovery results", summary, destination)
+        dialog.show_entries(results)
+        open_destination = QPushButton("Open destination")
+
+        def open_folder():
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(destination))):
+                QMessageBox.warning(dialog, "Couldn’t open destination", "Open the recovery folder in your file manager.")
+
+        open_destination.clicked.connect(open_folder)
+        dialog.add_actions("Done", open_destination)
+        dialog.exec()
+
     def closeEvent(self, event) -> None:
+        if self.recovery_worker is not None:
+            self.close_after_scan = True
+            self.stop_recovery()
+            event.ignore()
+            return
         if self.thread is not None:
             self.close_after_scan = True
             self.set_status("Closing after comparison…", "clock")
@@ -659,6 +1037,9 @@ def main() -> int:
     window.setStyleSheet(STYLESHEET)
     window.show()
     exit_code = app.exec()
+    if window.recovery_worker is not None:
+        window.recovery_worker.stop.set()
+        window.recovery_worker.wait()
     if window.thread is not None:
         window.thread.wait()
     return exit_code

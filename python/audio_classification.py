@@ -2,8 +2,10 @@
 
 import os
 import stat
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from enum import Enum
+from hashlib import sha256
 from pathlib import Path
 
 AIFF_EXTENSIONS = {".aiff", ".aif"}
@@ -31,13 +33,20 @@ class AudioFormat(Enum):
 class Classification:
     audio_format: AudioFormat
     unknown_files: int = 0
+    # A scan signature belongs to the recovery workflow, not the audio category.
+    fingerprint: str = field(default="", compare=False, repr=False)
 
 
 class ClassificationError(Exception):
     """A folder could not be inspected completely."""
 
 
-def classify_folder(original: Path, relative_path: str) -> Classification:
+def classify_folder(
+    original: Path,
+    relative_path: str,
+    *,
+    visit: Callable[[Path, os.stat_result], None] | None = None,
+) -> Classification:
     """Inspect one independent missing directory and its descendants."""
     parts = relative_path.split("/")
     if any(part in ("", ".", "..") or Path(part).name != part for part in parts):
@@ -45,6 +54,16 @@ def classify_folder(original: Path, relative_path: str) -> Classification:
 
     formats: set[AudioFormat] = set()
     unknown_files = 0
+    fingerprint = sha256()
+
+    def record(path: Path, info: os.stat_result) -> None:
+        relative = path.relative_to(tree)
+        fingerprint.update(os.fsencode(relative))
+        fingerprint.update(b"\0")
+        fingerprint.update(repr(file_signature(info)).encode("ascii"))
+        fingerprint.update(b"\n")
+        if visit is not None:
+            visit(relative, info)
 
     try:
         # Recheck each component below the selected root. A folder may have
@@ -55,17 +74,20 @@ def classify_folder(original: Path, relative_path: str) -> Classification:
             folder = folder / part
             _require_directory(folder)
 
-        pending = [folder / parts[-1]]
+        tree = folder / parts[-1]
+        pending = [tree]
         while pending:
             folder = pending.pop()
-            _require_directory(folder)
+            record(folder, _require_directory(folder))
             with os.scandir(folder) as entries:
-                for entry in entries:
+                for entry in sorted(entries, key=lambda entry: entry.name):
                     # is_file() can return False for a vanished entry. A stat
                     # lets us report that the scan was incomplete instead.
                     entry_path = folder / entry.name
                     info = entry_path.lstat()
-                    if _is_link(info):
+                    if not stat.S_ISDIR(info.st_mode) or is_redirect(info):
+                        record(entry_path, info)
+                    if is_redirect(info):
                         continue
                     if stat.S_ISDIR(info.st_mode):
                         pending.append(entry_path)
@@ -99,17 +121,24 @@ def classify_folder(original: Path, relative_path: str) -> Classification:
         audio_format = formats.pop()
     else:
         audio_format = AudioFormat.MIXED
-    return Classification(audio_format, unknown_files)
+    return Classification(audio_format, unknown_files, fingerprint.hexdigest())
 
 
-def _require_directory(folder: Path) -> None:
+def _require_directory(folder: Path) -> os.stat_result:
     info = folder.lstat()
-    if _is_link(info) or not stat.S_ISDIR(info.st_mode):
+    if is_redirect(info) or not stat.S_ISDIR(info.st_mode):
         raise NotADirectoryError
+    return info
 
 
-def _is_link(info: os.stat_result) -> bool:
+def is_redirect(info: os.stat_result) -> bool:
     # Windows junctions and other reparse points can redirect traversal.
     return stat.S_ISLNK(info.st_mode) or bool(
         getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     )
+
+
+def file_signature(info: os.stat_result) -> tuple[int, ...]:
+    # Reading may update atime. Identity, type, size and change times are what
+    # matter when comparing two observations of the same file.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
