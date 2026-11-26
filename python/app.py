@@ -651,11 +651,13 @@ class Window(QWidget):
         layout.addSpacing(26)
 
         result_heading = QHBoxLayout()
+        result_heading.setSpacing(12)
         result_heading.addWidget(label("Missing content", "sectionTitle"))
         result_heading.addStretch()
         self.count = label(style="count")
         result_heading.addWidget(self.count)
         self.select_all = QPushButton("Select all")
+        self.select_all.setFixedWidth(120)
         self.select_all.setMinimumHeight(36)
         self.select_all.hide()
         result_heading.addWidget(self.select_all)
