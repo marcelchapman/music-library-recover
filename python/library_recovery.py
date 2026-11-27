@@ -3,6 +3,7 @@
 import ctypes
 import errno
 import os
+import re
 import shutil
 import stat
 import sys
@@ -61,6 +62,13 @@ class RecoveryItem:
 class Directory:
     path: Path
     identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class Mount:
+    point: Path
+    root: Path
+    device: bytes
 
 
 @dataclass(frozen=True)
@@ -124,7 +132,9 @@ def _inside(ancestor: Directory, child: Directory) -> bool:
 
 def validate_destination(original: Path, current: Path, destination: Path) -> tuple[Directory, Directory, Directory]:
     original_root, current_root, output = map(_directory, (original, current, destination))
-    if any(_inside(library, output) or _inside(output, library) for library in (original_root, current_root)):
+    mounts = _linux_mounts()
+    if any(_inside(library, output) or _inside(output, library) or _share_backing_tree(library, output, mounts)
+           for library in (original_root, current_root)):
         raise RecoveryError("Choose a recovery destination separate from both libraries.")
     return original_root, current_root, output
 
@@ -132,6 +142,47 @@ def validate_destination(original: Path, current: Path, destination: Path) -> tu
 def _guard(root: Directory) -> None:
     if _directory(root.path) != root:
         raise RecoveryError("A selected root folder changed. Compare again.")
+
+
+def _decode_mount_path(value: bytes) -> Path:
+    decoded = re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), value)
+    return Path(os.fsdecode(decoded))
+
+
+def _linux_mounts() -> tuple[Mount, ...]:
+    if not sys.platform.startswith("linux"):
+        return ()
+    # Bind mounts can have the same st_dev as their parent.
+    try:
+        lines = Path("/proc/self/mountinfo").read_bytes().splitlines()
+    except OSError as error:
+        raise RecoveryError("Couldn’t check Linux mount boundaries.") from error
+    mounts = []
+    for line in lines:
+        _, _, device, root, point, *_ = line.split()
+        mounts.append(Mount(_decode_mount_path(point), _decode_mount_path(root), device))
+    return tuple(mounts)
+
+
+def _linux_mount_points() -> set[Path]:
+    return {mount.point for mount in _linux_mounts()}
+
+
+def _backing_paths(directory: Directory, mounts: tuple[Mount, ...]) -> set[tuple[bytes, Path]]:
+    matches = [mount for mount in mounts if directory.path.is_relative_to(mount.point)]
+    depth = max((len(mount.point.parts) for mount in matches), default=0)
+    return {
+        (mount.device, mount.root / directory.path.relative_to(mount.point))
+        for mount in matches if len(mount.point.parts) == depth
+    }
+
+
+def _share_backing_tree(first: Directory, second: Directory, mounts: tuple[Mount, ...]) -> bool:
+    return any(
+        first_device == second_device and (first_path.is_relative_to(second_path) or second_path.is_relative_to(first_path))
+        for first_device, first_path in _backing_paths(first, mounts)
+        for second_device, second_path in _backing_paths(second, mounts)
+    )
 
 
 def _parts(relative: str) -> tuple[str, ...]:
@@ -150,6 +201,7 @@ def _target(root: Directory, relative: Path, *, create_parents: bool = False) ->
     if (relative.is_absolute() or ".." in relative.parts or target == root.path
             or not target.is_relative_to(root.path)):
         raise RecoveryError("A recovery path is outside the selected destination.")
+    mounts = _linux_mount_points()
     folder = root.path
     for part in relative.parts[:-1]:
         folder /= part
@@ -162,7 +214,8 @@ def _target(root: Directory, relative: Path, *, create_parents: bool = False) ->
             info = folder.lstat()
         except FileNotFoundError:
             return target
-        if is_redirect(info) or not stat.S_ISDIR(info.st_mode) or info.st_dev != root.identity[0]:
+        if (is_redirect(info) or not stat.S_ISDIR(info.st_mode)
+                or info.st_dev != root.identity[0] or folder in mounts):
             raise DestinationConflict("The output path passes through an existing file, link or mounted folder.")
     try:
         target.lstat()
@@ -198,13 +251,18 @@ def _source_entries(original: Directory, current: Directory, item: RecoveryItem,
     expected = item.classification
     if expected is None or expected.audio_format not in CATEGORIES or not expected.fingerprint:
         raise RecoveryError("This folder needs a completed audio classification. Compare again.")
+    tree = original.path.joinpath(*_parts(item.path))
+    mounts = _linux_mount_points()
+    if any(parent in mounts for parent in tree.parents if parent.is_relative_to(original.path)
+           and parent != original.path):
+        raise RecoveryError("This folder crosses into another mounted filesystem.")
     entries = []
 
     def visit(path, info):
         _cancel_if_requested(cancelled)
         if is_redirect(info) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
             raise RecoveryError("This folder contains a link or special item and was left untouched.")
-        if info.st_dev != original.identity[0]:
+        if info.st_dev != original.identity[0] or tree / path in mounts:
             raise RecoveryError("This folder crosses into another mounted filesystem.")
         entries.append((path, info))
 
@@ -258,8 +316,54 @@ def prepare_recovery(original: Path, current: Path, destination: Path, selected:
     return plan
 
 
-def _publish(source: Path, target: Path) -> None:
+def _linux_publish(rename, destination: Directory, stage: Directory, relative: Path) -> int:
+    """Use opened directories for both sides of the exclusive rename."""
+    mounts = _linux_mount_points()
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(destination.path, flags)
+    try:
+        if _identity(os.fstat(root_fd)) != destination.identity:
+            raise RecoveryError("The recovery destination changed. Compare again.")
+        stage_fd = os.open(stage.path.name, flags, dir_fd=root_fd)
+        try:
+            if _identity(os.fstat(stage_fd)) != stage.identity or stage.path in mounts:
+                raise RecoveryError("The temporary recovery folder changed.")
+            parent_fd = os.dup(root_fd)
+            try:
+                parent = destination.path
+                for part in relative.parts[:-1]:
+                    parent /= part
+                    if parent in mounts:
+                        raise DestinationConflict("The output path passes through a mounted folder.")
+                    try:
+                        os.mkdir(part, dir_fd=parent_fd)
+                    except FileExistsError:
+                        pass
+                    try:
+                        child_fd = os.open(part, flags, dir_fd=parent_fd)
+                    except OSError as error:
+                        if error.errno in (errno.ENOTDIR, errno.ELOOP):
+                            raise DestinationConflict("The output path passes through a file or link.") from error
+                        raise
+                    os.close(parent_fd)
+                    parent_fd = child_fd
+                    if os.fstat(parent_fd).st_dev != destination.identity[0]:
+                        raise DestinationConflict("The output path passes through a mounted folder.")
+                result = rename(stage_fd, b"content", parent_fd, os.fsencode(relative.name), 1)  # RENAME_NOREPLACE
+                return ctypes.get_errno() if result else 0
+            finally:
+                os.close(parent_fd)
+        finally:
+            os.close(stage_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _publish(destination: Directory, stage: Directory, relative: Path) -> None:
     """Publish without replacing even an empty folder created by another process."""
+    target = _target(destination, relative, create_parents=not sys.platform.startswith("linux"))
+    source = stage.path / "content"
+    _guard(stage)
     if os.name == "nt":
         try:
             os.rename(source, target)
@@ -272,16 +376,16 @@ def _publish(source: Path, target: Path) -> None:
             rename = libc.renamex_np
             rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
             result = rename(os.fsencode(source), os.fsencode(target), 0x00000004)  # RENAME_EXCL
+            code = ctypes.get_errno() if result else 0
         elif sys.platform.startswith("linux"):
             rename = libc.renameat2
             rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
-            result = rename(-100, os.fsencode(source), -100, os.fsencode(target), 1)  # AT_FDCWD, RENAME_NOREPLACE
+            code = _linux_publish(rename, destination, stage, relative)
         else:
             raise AttributeError
     except AttributeError as error:
         raise RecoveryError("This system doesn’t support publishing recovered folders without replacement.") from error
-    if result != 0:
-        code = ctypes.get_errno()
+    if code:
         if code in (errno.ENOSYS, errno.ENOTSUP, errno.EINVAL):
             raise RecoveryError("This destination doesn’t support publishing a folder without replacement.")
         if code in (errno.EEXIST, errno.ENOTEMPTY):
@@ -323,14 +427,18 @@ def _copy_file(source: Path, output: Path, approved: os.stat_result, cancelled) 
     _apply_metadata(output, approved)
 
 
-def _apply_metadata(path: Path, info: os.stat_result) -> None:
+def _apply_metadata(path: Path, info: os.stat_result, *, owner_access: bool = False) -> None:
     os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
-    os.chmod(path, stat.S_IMODE(info.st_mode) & 0o777)
+    mode = info.st_mode & 0o777
+    os.chmod(path, mode | 0o700 if owner_access else mode)
 
 
-def _stage_copy(plan: RecoveryPlan, folder: PlannedFolder, payload: Path, cancelled) -> None:
+def _stage_copy(plan: RecoveryPlan, folder: PlannedFolder, payload: Path, cancelled,
+                restrictive_dirs: list[Directory]) -> int | None:
     dirs = []
+    final_mode = None
     source = plan.original.path.joinpath(*_parts(folder.item.path))
+    mounts = _linux_mount_points()
     for relative, info in folder.entries:
         _cancel_if_requested(cancelled)
         output = payload / relative
@@ -345,15 +453,27 @@ def _stage_copy(plan: RecoveryPlan, folder: PlannedFolder, payload: Path, cancel
             for part in incoming.parent.relative_to(folder_path).parts:
                 folder_path /= part
                 live = _directory_info(folder_path)
-                if live.st_dev != plan.original.identity[0]:
+                if live.st_dev != plan.original.identity[0] or folder_path in mounts:
                     raise RecoveryError("A source path moved to another filesystem. Compare again.")
             _copy_file(incoming, output, info, cancelled)
     for output, info in reversed(dirs):
+        if os.name != "nt" and info.st_mode & 0o700 != 0o700:
+            if output == payload and sys.platform.startswith("linux") and not info.st_mode & stat.S_IWUSR:
+                # Linux may require write access to update ".." when moving
+                # the payload across parents. Restore its mode after rename.
+                final_mode = info.st_mode & 0o777
+                _apply_metadata(output, info, owner_access=True)
+                continue
+            restrictive_dirs.append(Directory(output, _identity(output.lstat())))
         _apply_metadata(output, info)
+    return final_mode
 
 
 def _recover_folder(plan: RecoveryPlan, folder: PlannedFolder, cancelled) -> EntryResult:
     stage = None
+    restrictive_dirs = []
+    published = False
+    payload_fd = None
     cleanup_warning = ""
     path = folder.item.path
     try:
@@ -365,14 +485,20 @@ def _recover_folder(plan: RecoveryPlan, folder: PlannedFolder, cancelled) -> Ent
         _guard(plan.destination)
         stage = _directory(Path(mkdtemp(prefix=".mlr-recovery-", dir=plan.destination.path)))
         payload = stage.path / "content"
-        _stage_copy(plan, folder, payload, cancelled)
+        final_mode = _stage_copy(plan, folder, payload, cancelled, restrictive_dirs)
         _source_entries(plan.original, plan.current, folder.item, cancelled)
         _cancel_if_requested(cancelled)
-        target = _target(plan.destination, folder.target, create_parents=True)
-        _guard(stage)
-        _cancel_if_requested(cancelled)
-        _publish(payload, target)
+        if final_mode is not None:
+            _guard(stage)
+            payload_fd = os.open(payload, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        _publish(plan.destination, stage, folder.target)
+        published = True
         result = EntryResult(path, Status.RECOVERED)
+        if payload_fd is not None:
+            try:
+                os.fchmod(payload_fd, final_mode)
+            except OSError:
+                result = EntryResult(path, Status.RECOVERED, "Couldn’t restore the recovered folder’s permissions.")
     except DestinationConflict as error:
         result = EntryResult(path, Status.SKIPPED, str(error))
     except RecoveryCancelled:
@@ -385,10 +511,20 @@ def _recover_folder(plan: RecoveryPlan, folder: PlannedFolder, cancelled) -> Ent
             detail = "The recovery destination ran out of space."
         result = EntryResult(path, Status.FAILED, detail)
     finally:
+        if payload_fd is not None:
+            os.close(payload_fd)
         if stage is not None:
             try:
                 _guard(plan.destination)
                 _guard(stage)
+                if any(mount.is_relative_to(stage.path) for mount in _linux_mount_points()):
+                    raise RecoveryError("The temporary folder contains a mount.")
+                if not published:
+                    # Restore access only on directories created by this transfer,
+                    # starting with their parents so nested paths are reachable.
+                    for directory in reversed(restrictive_dirs):
+                        _guard(directory)
+                        directory.path.chmod(0o700)
                 shutil.rmtree(stage.path)
             except (OSError, RecoveryError):
                 cleanup_warning = f" Temporary files may remain in {stage.path.name}."

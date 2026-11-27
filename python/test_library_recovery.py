@@ -1,5 +1,7 @@
 import errno
 import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -125,17 +127,20 @@ class LibraryRecoveryTests(unittest.TestCase):
 
     def test_exclusive_publish_preserves_even_an_empty_racing_directory(self):
         self.write(self.original, "Nova/01.mp3", b"new")
+        (self.output / "MP3").mkdir()
         plan = self.plan(self.item("Nova"))
-        publish = recovery._publish
+        target_check = recovery._target
         occupied = None
 
-        def race(source, target):
+        def race(*args, **kwargs):
             nonlocal occupied
-            target.mkdir()
-            occupied = target.stat().st_ino
-            publish(source, target)
+            target = target_check(*args, **kwargs)
+            if list(self.output.glob(".mlr-recovery-*")):
+                target.mkdir()
+                occupied = target.stat().st_ino
+            return target
 
-        with patch("library_recovery._publish", side_effect=race):
+        with patch("library_recovery._target", side_effect=race):
             self.assert_status(recover(plan), Status.SKIPPED)
         target = self.output / "MP3/Nova"
         self.assertEqual(target.stat().st_ino, occupied)
@@ -168,6 +173,111 @@ class LibraryRecoveryTests(unittest.TestCase):
         self.assert_status(recover(plan), Status.SKIPPED)
         self.assertEqual(list(outside.iterdir()), [])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux descriptor-based publication")
+    def test_redirect_after_final_path_check_cannot_publish_outside_destination(self):
+        outside = self.root / "Outside"
+        outside.mkdir()
+        self.write(self.original, "Artist/Nova/01.mp3", b"verified")
+        category = self.output / "MP3"
+        category.mkdir()
+        plan = self.plan(self.item("Artist/Nova"))
+        target_check = recovery._target
+
+        def redirect(*args, **kwargs):
+            target = target_check(*args, **kwargs)
+            if list(self.output.glob(".mlr-recovery-*")):
+                category.rmdir()
+                self.make_link(category, outside)
+            return target
+
+        with patch("library_recovery._target", side_effect=redirect):
+            self.assert_status(recover(plan), Status.SKIPPED)
+        self.assertTrue(category.is_symlink())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assert_no_staging()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux bind mount checks")
+    def test_same_device_mount_boundaries_are_rejected(self):
+        self.write(self.original, "Artist/Nova/01.mp3", b"source")
+        category = self.output / "MP3"
+        category.mkdir()
+        item = self.item("Artist/Nova")
+        self.assertEqual(category.stat().st_dev, (self.original / "Artist").stat().st_dev)
+        for mount in (self.original / "Artist", self.original / "Artist/Nova", category):
+            with self.subTest(mount=mount.name), patch.object(recovery, "_linux_mount_points", return_value={mount}):
+                plan = self.plan(item)
+                self.assertFalse(plan.folders)
+                self.assert_status(recover(plan), Status.SKIPPED)
+                self.assertIn("mounted", plan.skipped[0].detail)
+        self.assertEqual(list(category.iterdir()), [])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux mountinfo format")
+    def test_mountinfo_decodes_escaped_mount_points(self):
+        sample = rb"52 37 8:1 /library /media/Space\040and\134slash rw - ext4 /dev/sda1 rw"
+        with patch.object(Path, "read_bytes", return_value=sample):
+            self.assertEqual(recovery._linux_mount_points(), {Path("/media/Space and\\slash")})
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux bind mount aliases")
+    def test_destination_alias_of_library_descendant_is_rejected(self):
+        device = b"8:1"
+        for library in (self.original, self.current):
+            mounts = (
+                recovery.Mount(self.root, Path("/fixture"), device),
+                recovery.Mount(self.output, Path("/fixture") / library.name / "Child", device),
+            )
+            with self.subTest(library=library.name), patch.object(recovery, "_linux_mounts", return_value=mounts):
+                with self.assertRaisesRegex(RecoveryError, "separate from both libraries"):
+                    self.plan()
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory modes")
+    def test_publication_conflict_cleans_staged_read_only_directories(self):
+        self.write(self.original, "Nova/Disc 1/01.mp3", b"verified")
+        album = self.original / "Nova"
+        disc = album / "Disc 1"
+        abandoned = self.write(self.output, ".mlr-recovery-foreign/content/preserve", b"keep")
+        self.addCleanup(album.chmod, 0o700)
+        self.addCleanup(disc.chmod, 0o700)
+        for directory in (album, disc):
+            directory.chmod(0o555)
+        plan = self.plan(self.item("Nova"))
+        with patch.object(recovery, "_publish", side_effect=recovery.DestinationConflict("Late conflict")):
+            self.assert_status(recover(plan), Status.SKIPPED)
+        self.assertEqual(list(self.output.glob(".mlr-recovery-*")), [abandoned.parents[1]])
+        self.assertEqual(abandoned.read_bytes(), b"keep")
+        for directory in (album, disc):
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o555)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux read-only directory rename")
+    def test_read_only_album_is_published_with_original_modes(self):
+        self.write(self.original, "Nova/Disc 1/01.mp3", b"verified")
+        album = self.original / "Nova"
+        for directory in (album, album / "Disc 1"):
+            self.addCleanup(directory.chmod, 0o700)
+            directory.chmod(0o555)
+        plan = self.plan(self.item("Nova"))
+        self.assert_status(recover(plan), Status.RECOVERED)
+        restored = self.output / "MP3/Nova"
+        for directory in (restored, restored / "Disc 1"):
+            self.addCleanup(directory.chmod, 0o700)
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o555)
+        self.assertEqual((restored / "Disc 1/01.mp3").read_bytes(), b"verified")
+        self.assert_no_staging()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux post-publication permissions")
+    def test_permission_restore_failure_reports_published_folder(self):
+        self.write(self.original, "Nova/01.mp3", b"verified")
+        album = self.original / "Nova"
+        self.addCleanup(album.chmod, 0o700)
+        album.chmod(0o555)
+        plan = self.plan(self.item("Nova"))
+        with patch.object(recovery.os, "fchmod", side_effect=PermissionError(errno.EACCES, "injected")):
+            results = recover(plan)
+        self.assert_status(results, Status.RECOVERED)
+        self.assertIn("restore", results[0].detail)
+        self.assertEqual((self.output / "MP3/Nova/01.mp3").read_bytes(), b"verified")
+        self.assert_no_staging()
+
     def test_nested_source_symlink_is_blocked(self):
         outside = self.root / "Outside"
         outside.mkdir()
@@ -191,6 +301,64 @@ class LibraryRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(RecoveryError, "enough free space"):
                 self.plan(self.item("Nova"))
         self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_copy_io_errors_preserve_completed_output_and_clean_up(self):
+        first = self.write(self.original, "Atlas/01.mp3", bytes(range(256)))
+        second = self.write(self.original, "Nova/01.mp3", bytes(range(255, -1, -1)))
+        unrelated = self.write(self.output, "Keep.txt", b"unrelated")
+        plan = self.plan(self.item("Atlas"), self.item("Nova"))
+        for failure in (errno.ENOSPC, errno.EACCES, errno.EIO):
+            with self.subTest(errno=failure):
+                with patch.object(recovery.os, "fsync", side_effect=[None, OSError(failure, "injected")]):
+                    results = recover(plan)
+                self.assert_status(results, Status.RECOVERED, Status.FAILED)
+                if failure == errno.ENOSPC:
+                    self.assertIn("ran out of space", results[1].detail)
+                completed = self.output / "MP3/Atlas/01.mp3"
+                self.assertEqual(completed.read_bytes(), first.read_bytes())
+                self.assertFalse((self.output / "MP3/Nova").exists())
+                self.assertEqual(second.read_bytes(), bytes(range(255, -1, -1)))
+                self.assertEqual(unrelated.read_bytes(), b"unrelated")
+                self.assert_no_staging()
+                completed.unlink()
+                completed.parent.rmdir()
+
+    def test_source_read_denial_leaves_no_recovered_folder(self):
+        source = self.write(self.original, "Nova/01.mp3", b"verified")
+        plan = self.plan(self.item("Nova"))
+        open_file = os.open
+
+        def deny(path, *args, **kwargs):
+            if path == source:
+                raise PermissionError(errno.EACCES, "injected")
+            return open_file(path, *args, **kwargs)
+
+        with patch.object(recovery.os, "open", side_effect=deny):
+            self.assert_status(recover(plan), Status.FAILED)
+        self.assertEqual(source.read_bytes(), b"verified")
+        self.assertFalse((self.output / "MP3/Nova").exists())
+        self.assert_no_staging()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux exclusive rename")
+    def test_unsupported_exclusive_rename_fails_without_fallback(self):
+        self.write(self.original, "Nova/01.mp3", b"verified")
+        plan = self.plan(self.item("Nova"))
+        for code in (None, errno.ENOSYS, errno.ENOTSUP, errno.EINVAL):
+            with self.subTest(code=code):
+                with patch.object(recovery.ctypes, "CDLL") as libc, patch.object(recovery.os, "rename") as rename:
+                    if code is None:
+                        del libc.return_value.renameat2
+                    else:
+                        def unsupported(*args):
+                            recovery.ctypes.set_errno(code)
+                            return -1
+                        libc.return_value.renameat2.side_effect = unsupported
+                    results = recover(plan)
+                    rename.assert_not_called()
+                self.assert_status(results, Status.FAILED)
+                self.assertIn("without replacement", results[0].detail)
+                self.assertFalse((self.output / "MP3/Nova").exists())
+                self.assert_no_staging()
 
     def test_unavailable_classification_is_ineligible_until_rescanned(self):
         self.write(self.original, "Archive/Track.xyz", b"unknown bytes")
@@ -305,26 +473,46 @@ class LibraryRecoveryTests(unittest.TestCase):
     def test_mid_transfer_cancel_preserves_previously_completed_and_cleans_stage(self):
         for path in ("Atlas", "Nova", "Orion"):
             self.write(self.original, f"{path}/01.mp3", b"data")
+        self.write(self.original, "Nova/01.mp3", b"\x9a" * (recovery.CHUNK_SIZE + 1))
         plan = self.plan(*(self.item(path) for path in ("Atlas", "Nova", "Orion")))
         stopped = Event()
-        copy = recovery._copy_file
         updates = []
 
-        def interrupt(source, output, approved, cancelled):
-            if source.parent.name == "Nova":
-                output.write_bytes(b"partial")
+        def cancelled():
+            staged = self.output.glob(".mlr-recovery-*/content/01.mp3")
+            if any(path.stat().st_size >= recovery.CHUNK_SIZE for path in staged):
                 stopped.set()
-                raise recovery.RecoveryCancelled
-            copy(source, output, approved, cancelled)
+            return stopped.is_set()
 
-        with patch("library_recovery._copy_file", side_effect=interrupt):
-            results = recover(plan, cancelled=stopped.is_set, progress=lambda *args: updates.append(args))
+        results = recover(plan, cancelled=cancelled, progress=lambda *args: updates.append(args))
         self.assert_status(results, Status.RECOVERED, Status.CANCELLED, Status.CANCELLED)
         self.assertEqual((self.output / "MP3/Atlas/01.mp3").read_bytes(), b"data")
         self.assertFalse((self.output / "MP3/Nova").exists())
         self.assertFalse((self.output / "MP3/Orion").exists())
         self.assertEqual(updates[-1], (1, 3, ""))
         self.assert_no_staging()
+
+    def test_cleanup_preserves_an_unrelated_replacement_for_the_stage(self):
+        self.write(self.original, "Nova/01.mp3", b"verified")
+        unrelated = self.write(self.output, "Unrelated/Keep.txt", b"keep")
+        plan = self.plan(self.item("Nova"))
+        displaced = self.output / "Displaced"
+        replacement = None
+
+        def replace_stage(destination, stage, relative):
+            nonlocal replacement
+            stage.path.rename(displaced)
+            unrelated.parent.rename(stage.path)
+            replacement = stage.path
+            raise recovery.DestinationConflict("Late conflict")
+
+        with patch.object(recovery, "_publish", side_effect=replace_stage):
+            results = recover(plan)
+        self.assert_status(results, Status.SKIPPED)
+        self.assertIn("Temporary files may remain", results[0].detail)
+        self.assertEqual((replacement / "Keep.txt").read_bytes(), b"keep")
+        self.assertEqual((displaced / "content/01.mp3").read_bytes(), b"verified")
+        self.assertFalse((self.output / "MP3/Nova").exists())
 
     def test_integrity_mismatch_prevents_publication(self):
         self.write(self.original, "Nova/01.mp3", b"original")
@@ -367,6 +555,69 @@ class LibraryRecoveryTests(unittest.TestCase):
             self.assert_status(recover(plan), Status.FAILED)
         self.assertFalse((self.output / "MP3/Nova").exists())
         self.assert_no_staging()
+
+    def test_source_removal_after_copy_prevents_publication(self):
+        source = self.write(self.original, "Nova/01.mp3", b"verified")
+        plan = self.plan(self.item("Nova"))
+        copy = recovery._copy_file
+
+        def remove(*args):
+            copy(*args)
+            source.unlink()
+
+        with patch.object(recovery, "_copy_file", side_effect=remove):
+            self.assert_status(recover(plan), Status.FAILED)
+        self.assertFalse((self.output / "MP3/Nova").exists())
+        self.assert_no_staging()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Native Linux publication and restart")
+    def test_process_exit_leaves_only_its_stage_and_next_run_preserves_it(self):
+        first = self.write(self.original, "Atlas/01.mp3", b"first")
+        second = self.write(self.original, "Nova/01.mp3", b"second")
+        unrelated = self.write(self.output, ".mlr-recovery-unrelated/Keep", b"keep")
+        script = """
+import os
+import sys
+from pathlib import Path
+from audio_classification import classify_folder
+import library_recovery as r
+
+original, current, destination = map(Path, sys.argv[1:])
+plan = r.prepare_recovery(original, current, destination, [
+    r.RecoveryItem(name, classify_folder(original, name)) for name in ("Atlas", "Nova")
+])
+copy = r._copy_file
+
+def interrupt(source, output, approved, cancelled):
+    if source.parent.name == "Nova":
+        output.write_bytes(b"partial")
+        os._exit(23)
+    copy(source, output, approved, cancelled)
+
+r._copy_file = interrupt
+r.recover(plan)
+"""
+        child = subprocess.run(
+            [sys.executable, "-c", script, *map(str, (self.original, self.current, self.output))],
+            cwd=Path(recovery.__file__).parent, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(child.returncode, 23, child.stderr)
+        (abandoned,) = set(self.output.glob(".mlr-recovery-*")) - {unrelated.parent}
+        partial = abandoned / "content/01.mp3"
+        self.assertEqual(partial.read_bytes(), b"partial")
+        completed = self.output / "MP3/Atlas/01.mp3"
+        self.assertEqual(completed.read_bytes(), first.read_bytes())
+        completed_identity = completed.stat().st_ino
+        self.assertFalse((self.output / "MP3/Nova").exists())
+
+        self.assert_status(recover(self.plan(self.item("Atlas"), self.item("Nova"))),
+                           Status.SKIPPED, Status.RECOVERED)
+        self.assertEqual((self.output / "MP3/Nova/01.mp3").read_bytes(), second.read_bytes())
+        self.assertEqual(completed.stat().st_ino, completed_identity)
+        self.assertEqual(completed.read_bytes(), first.read_bytes())
+        self.assertEqual(partial.read_bytes(), b"partial")
+        self.assertEqual(unrelated.read_bytes(), b"keep")
+        self.assertEqual(set(self.output.glob(".mlr-recovery-*")), {abandoned, unrelated.parent})
 
     def test_folder_added_to_current_library_after_comparison_is_skipped(self):
         self.write(self.original, "Nova/01.mp3", b"mp3")
